@@ -147,7 +147,7 @@ impl VinmonopoletMcp {
     }
 
     #[tool(
-        description = "Execute a read-only SELECT query against the Vinmonopolet Products SQLite database. Returns columns and rows. Only SELECT statements are accepted."
+        description = "Execute a read-only SELECT query against the Vinmonopolet Products SQLite database. Returns columns and rows. Only SELECT statements are accepted. Schema: Products(Id INTEGER, ProductId TEXT, ProductShortName TEXT, Percentage REAL, CostPerLiter REAL). Use CostPerLiter for price comparisons, not price. Example: SELECT ProductShortName, Percentage, CostPerLiter FROM Products WHERE CostPerLiter > 0 ORDER BY CostPerLiter DESC LIMIT 5."
     )]
     async fn sql(
         &self,

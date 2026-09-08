@@ -19,7 +19,18 @@ VINMONOPOLET_DB_PATH=/Users/lagos/code/vinmonopolet-database-mcp/vinmonopolet.db
 
 The database is opened read-only. The only exposed tool is `sql`, which accepts
 one `SELECT` statement and returns `{ "columns": [...], "rows": [...] }`.
-Results are limited to 1,000 rows by default; change that with
+The `Products` table has these columns:
+
+| Column | Type | Meaning |
+| --- | --- | --- |
+| `Id` | INTEGER | Internal database ID |
+| `ProductId` | TEXT | Vinmonopolet product identifier |
+| `ProductShortName` | TEXT | Product name |
+| `Percentage` | REAL | Alcohol percentage |
+| `CostPerLiter` | REAL | Price per liter |
+
+Use `CostPerLiter` for price comparisons; there is no `price` column. Results
+are limited to 1,000 rows by default; change that with
 `VINMONOPOLET_MAX_ROWS`.
 
 ## MCP client configuration
