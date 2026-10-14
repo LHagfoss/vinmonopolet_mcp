@@ -3,10 +3,10 @@ use std::{env, path::PathBuf};
 use anyhow::{Context, Result};
 use base64::Engine;
 use rmcp::{
-    ErrorData as McpError, ServiceExt,
+    ErrorData as McpError, ServerHandler, ServiceExt,
     handler::server::wrapper::Parameters,
-    model::{CallToolResult, ContentBlock},
-    schemars, tool, tool_router,
+    model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerInfo},
+    schemars, tool, tool_handler, tool_router,
     transport::stdio,
 };
 use rusqlite::{Connection, OpenFlags, types::ValueRef};
@@ -55,22 +55,68 @@ fn find_default_database() -> Option<PathBuf> {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct SqlParams {
-    /// A read-only SELECT statement. Include LIMIT for large result sets.
+    /// One SQLite SELECT (or WITH ... SELECT) statement. Add LIMIT for large results.
     statement: String,
 }
 
 #[derive(Clone)]
 struct VinmonopoletMcp {
     cfg: Config,
+    instructions: String,
 }
 
-fn mcp_error(error: impl std::fmt::Display) -> McpError {
-    McpError::internal_error(error.to_string(), None)
+/// Successful results are JSON text; failures (SQL syntax, unknown column,
+/// rejected statement) become `isError: true` results so the model can read
+/// the message and correct its query.
+fn tool_result(result: Result<serde_json::Value>) -> CallToolResult {
+    match result.and_then(|value| Ok(serde_json::to_string(&value)?)) {
+        Ok(text) => CallToolResult::success(vec![ContentBlock::text(text)]),
+        Err(error) => CallToolResult::error(vec![ContentBlock::text(format!("error: {error:#}"))]),
+    }
 }
 
-fn text_result(value: serde_json::Value) -> Result<CallToolResult, McpError> {
-    let text = serde_json::to_string_pretty(&value).map_err(mcp_error)?;
-    Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+/// Describe the user tables as `Table(col TYPE, ...)` lines for the server
+/// instructions, so the schema is available without bloating the tool description.
+fn describe_schema(path: &PathBuf) -> Result<String> {
+    let connection = open_database(path)?;
+    let mut tables = connection.prepare(
+        "SELECT name FROM sqlite_master WHERE type IN ('table', 'view') \
+         AND name NOT LIKE 'sqlite_%' ORDER BY name",
+    )?;
+    let names = tables
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut lines = Vec::new();
+    for name in names {
+        let mut info = connection.prepare("SELECT name, type FROM pragma_table_info(?1)")?;
+        let columns = info
+            .query_map([&name], |row| {
+                let column: String = row.get(0)?;
+                let ty: String = row.get(1)?;
+                Ok(if ty.is_empty() {
+                    column
+                } else {
+                    format!("{column} {ty}")
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        lines.push(format!("{name}({})", columns.join(", ")));
+    }
+    Ok(lines.join("\n"))
+}
+
+fn build_instructions(cfg: &Config) -> String {
+    let schema = describe_schema(&cfg.db_path).unwrap_or_else(|_| {
+        "Products(Id INTEGER, ProductId TEXT, ProductShortName TEXT, Percentage REAL, CostPerLiter REAL)"
+            .into()
+    });
+    format!(
+        "Read-only SQLite database of Vinmonopolet (Norwegian alcohol retailer) products, \
+         queried with the sql tool.\nSchema:\n{schema}\nNotes: Percentage is alcohol by volume (%). \
+         CostPerLiter is NOK per liter; 0 means unknown, so filter CostPerLiter > 0 when comparing \
+         prices. Use LIKE for name matching. At most {} rows are returned per query.",
+        cfg.max_rows
+    )
 }
 
 fn open_database(path: &PathBuf) -> Result<Connection> {
@@ -93,14 +139,16 @@ fn value_to_json(value: ValueRef<'_>) -> serde_json::Value {
 }
 
 fn execute_select(cfg: Config, sql: String) -> Result<serde_json::Value> {
-    let trimmed = sql.trim();
+    let trimmed = sql.trim().trim_end_matches(';').trim_end();
     if trimmed.is_empty() {
         anyhow::bail!("statement must not be empty");
     }
     if !trimmed
         .split_ascii_whitespace()
         .next()
-        .is_some_and(|keyword| keyword.eq_ignore_ascii_case("select"))
+        .is_some_and(|keyword| {
+            keyword.eq_ignore_ascii_case("select") || keyword.eq_ignore_ascii_case("with")
+        })
     {
         anyhow::bail!("only SELECT statements are allowed");
     }
@@ -119,13 +167,12 @@ fn execute_select(cfg: Config, sql: String) -> Result<serde_json::Value> {
         .collect::<Vec<_>>();
     let mut rows = statement.query([])?;
     let mut result = Vec::new();
+    let mut truncated = false;
 
     while let Some(row) = rows.next()? {
         if result.len() >= cfg.max_rows {
-            anyhow::bail!(
-                "query returned more than {} rows; add a LIMIT or raise VINMONOPOLET_MAX_ROWS",
-                cfg.max_rows
-            );
+            truncated = true;
+            break;
         }
 
         let values = (0..columns.len())
@@ -134,20 +181,34 @@ fn execute_select(cfg: Config, sql: String) -> Result<serde_json::Value> {
         result.push(serde_json::Value::Array(values));
     }
 
-    Ok(serde_json::json!({
+    let mut value = serde_json::json!({
         "columns": columns,
         "rows": result,
-    }))
+    });
+    if truncated {
+        value["truncated"] = serde_json::json!(format!(
+            "stopped after {} rows; add LIMIT or narrow the query",
+            cfg.max_rows
+        ));
+    }
+    Ok(value)
 }
 
-#[tool_router(server_handler)]
+#[tool_router]
 impl VinmonopoletMcp {
     fn new(cfg: Config) -> Self {
-        Self { cfg }
+        let instructions = build_instructions(&cfg);
+        Self { cfg, instructions }
     }
 
     #[tool(
-        description = "Execute a read-only SELECT query against the Vinmonopolet Products SQLite database. Returns columns and rows. Only SELECT statements are accepted. Schema: Products(Id INTEGER, ProductId TEXT, ProductShortName TEXT, Percentage REAL, CostPerLiter REAL). Use CostPerLiter for price comparisons, not price. Example: SELECT ProductShortName, Percentage, CostPerLiter FROM Products WHERE CostPerLiter > 0 ORDER BY CostPerLiter DESC LIMIT 5."
+        description = "Run one read-only SELECT on the Vinmonopolet SQLite DB (main table Products(ProductShortName, Percentage, CostPerLiter, ...); full schema in server instructions). Returns {columns, rows}.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn sql(
         &self,
@@ -156,9 +217,20 @@ impl VinmonopoletMcp {
         let cfg = self.cfg.clone();
         let result = tokio::task::spawn_blocking(move || execute_select(cfg, params.statement))
             .await
-            .map_err(mcp_error)?
-            .map_err(mcp_error)?;
-        text_result(result)
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        Ok(tool_result(result))
+    }
+}
+
+#[tool_handler]
+impl ServerHandler for VinmonopoletMcp {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new(
+                "vinmonopolet",
+                env!("CARGO_PKG_VERSION"),
+            ))
+            .with_instructions(self.instructions.clone())
     }
 }
 
@@ -215,6 +287,71 @@ mod tests {
             serde_json::json!(["Id", "ProductShortName"])
         );
         assert_eq!(result["rows"], serde_json::json!([[1, "Test wine"]]));
+        fs::remove_file(path)?;
+        Ok(())
+    }
+
+    fn temp_db(tag: &str) -> Result<PathBuf> {
+        let path =
+            env::temp_dir().join(format!("vinmonopolet-mcp-{tag}-{}.db", std::process::id()));
+        let _ = fs::remove_file(&path);
+        let connection = Connection::open(&path)?;
+        connection.execute_batch(
+            "CREATE TABLE Products (Id INTEGER, ProductShortName TEXT, CostPerLiter REAL);
+             INSERT INTO Products VALUES (1, 'A', 10.0), (2, 'B', 20.0), (3, 'C', 0.0);",
+        )?;
+        Ok(path)
+    }
+
+    #[test]
+    fn truncates_instead_of_failing_and_accepts_cte_and_trailing_semicolon() -> Result<()> {
+        let path = temp_db("trunc")?;
+        let cfg = Config {
+            db_path: path.clone(),
+            max_rows: 2,
+        };
+        let result = execute_select(cfg.clone(), "SELECT Id FROM Products;".into())?;
+        assert_eq!(result["rows"], serde_json::json!([[1], [2]]));
+        assert!(result["truncated"].is_string());
+        let result = execute_select(
+            cfg.clone(),
+            "WITH p AS (SELECT * FROM Products WHERE CostPerLiter > 0) SELECT count(*) FROM p"
+                .into(),
+        )?;
+        assert_eq!(result["rows"], serde_json::json!([[2]]));
+        assert!(result.get("truncated").is_none());
+        assert!(execute_select(cfg, "WITH p AS (SELECT 1) DELETE FROM Products".into()).is_err());
+        fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn sql_errors_become_error_results() -> Result<()> {
+        let path = temp_db("err")?;
+        let cfg = Config {
+            db_path: path.clone(),
+            max_rows: 10,
+        };
+        let result = tool_result(execute_select(cfg, "SELECT Nope FROM Products".into()));
+        assert_eq!(result.is_error, Some(true));
+        let text = serde_json::to_string(&result.content)?;
+        assert!(text.contains("no such column"), "{text}");
+        fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn instructions_include_live_schema() -> Result<()> {
+        let path = temp_db("schema")?;
+        let cfg = Config {
+            db_path: path.clone(),
+            max_rows: 10,
+        };
+        let text = build_instructions(&cfg);
+        assert!(
+            text.contains("Products(Id INTEGER, ProductShortName TEXT, CostPerLiter REAL)"),
+            "{text}"
+        );
         fs::remove_file(path)?;
         Ok(())
     }
